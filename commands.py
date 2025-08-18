@@ -2,11 +2,68 @@ from nextcord import Interaction, SlashOption
 from nextcord.ext import commands
 from colorama import Fore
 
-from ha_api import get_cached_entity_details as fetch_entity_details, call_ha_assist, fetch_all_entities
+from ha_api import fetch_entity_details, call_ha_assist, fetch_all_entities
 from db import is_watching, add_watch, remove_watch, get_watched_entities
 from utils import log
 import re
 
+# ---- Entity resolver ---------------------------------------------------------
+async def resolve_entity_id_or_prompt(interaction: Interaction, query: str):
+    """
+    Resolve a user-provided string (friendly name or entity_id) to a single entity_id.
+    If 0 or >1 match, send a helpful reply and return None.
+    """
+    query = (query or "").strip()
+    if not query:
+        await interaction.response.send_message("You must specify an entity to watch.")
+        return None
+
+    # {entity_id: friendly_name}
+    all_entities = await fetch_all_entities()
+
+    # Fast path: exact entity_id present
+    if "." in query and query in all_entities:
+        return query
+
+    ql = query.lower()
+
+    # 1) Exact matches (by name or id), case-insensitive
+    exact_name = [(eid, name) for eid, name in all_entities.items()
+                  if (name or "").lower() == ql]
+    exact_eid  = [(eid, all_entities[eid]) for eid in all_entities
+                  if eid.lower() == ql]
+
+    candidates = []
+    seen = set()
+    for pair in (exact_eid + exact_name):
+        if pair[0] not in seen:
+            candidates.append(pair)
+            seen.add(pair[0])
+
+    # 2) Fallback: substring match on friendly name
+    if not candidates:
+        for eid, name in all_entities.items():
+            if name and ql in name.lower():
+                if eid not in seen:
+                    candidates.append((eid, name))
+                    seen.add(eid)
+
+    # Outcome handling
+    if len(candidates) == 1:
+        return candidates[0][0]
+
+    if len(candidates) == 0:
+        await interaction.response.send_message(
+            f"No entity matched `{query}`. Try the exact entity_id (e.g., `sensor.front_load_washer`)."
+        )
+        return None
+
+    # Too many — present a short list to choose from
+    lines = "\n".join(f"- {name or '(no name)'} — `{eid}`" for eid, name in candidates[:20])
+    await interaction.response.send_message(
+        f"Multiple entities matched `{query}`. Please choose one of these exact `entity_id`s:\n{lines}"
+    )
+    return None
 
 def setup_slash_commands(bot):
     from config import GUILD_IDS, GUILD_MODE
@@ -48,12 +105,24 @@ def setup_slash_commands(bot):
                 await interaction.response.send_message("You must specify an entity_id to watch.")
                 return
 
+            # Resolve friendly name -> entity_id (ensure exactly one match)
+            resolved = await resolve_entity_id_or_prompt(interaction, entity_id)
+            if not resolved:
+                return
+            entity_id = resolved
+
             # Parse condition
             from_state = to_state = rule_type = "any"
             operator = threshold = None
 
             # Fetch current state to validate against
             friendly_name, icon, current_state, device_class = await fetch_entity_details(entity_id)
+            if friendly_name is None and current_state is None:
+                await interaction.response.send_message(
+                    f"Couldn’t read `{entity_id}` from Home Assistant. "
+                    "Double-check the entity_id or try again."
+                )
+                return
 
             if condition:
                 if "->" in condition:
