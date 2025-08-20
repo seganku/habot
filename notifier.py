@@ -1,7 +1,15 @@
-from config import HA_URL, HA_ACCESS_TOKEN, MDI_PNG_URL
+try:
+    # Prefer new config knobs, but don't crash if not defined yet
+    from config import HA_URL, HA_ACCESS_TOKEN, BRIGHTNESS_NOTIFICATIONS, BRIGHTNESS_MIN_PERCENT, BRIGHTNESS_MIN_DELTA
+except Exception:
+    from config import HA_URL, HA_ACCESS_TOKEN
+    BRIGHTNESS_NOTIFICATIONS = True
+    BRIGHTNESS_MIN_PERCENT = 5
+    BRIGHTNESS_MIN_DELTA = 16
 from utils import log
 from db import get_watchers
 from ha_api import fetch_entity_details, get_readable_state
+from icons import get_colored_icon_path
 from icons import get_icon_path
 import nextcord
 from nextcord.utils import get
@@ -22,17 +30,57 @@ async def get_or_create_webhook(channel: nextcord.TextChannel) -> nextcord.Webho
     get_or_create_webhook.cache[channel.id] = webhook
     return webhook
 
-async def notify_watchers(bot, entity_id, old_state, new_state):
+    if v is None:
+        return None
+    try:
+        return round(int(v) * 100 / 255)
+    except Exception:
+        return None
+
+def _bri_to_pct(v):
+    if v is None:
+        return None
+    try:
+        return round(int(v) * 100 / 255)
+    except Exception:
+        return None
+
+def _brightness_changed_enough(old_bri, new_bri):
+    if old_bri is None or new_bri is None:
+        return False
+    try:
+        delta = abs(int(new_bri) - int(old_bri))
+    except Exception:
+        return False
+    if BRIGHTNESS_MIN_PERCENT is not None:
+        return (delta * 100 / 255) >= BRIGHTNESS_MIN_PERCENT
+    return delta >= (BRIGHTNESS_MIN_DELTA or 0)
+
+async def notify_watchers(bot, entity_id, old_state, new_state, old_attrs=None, new_attrs=None):
     rows = get_watchers(entity_id)
     friendly_name, icon, current_state, device_class = await fetch_entity_details(entity_id)
 
     display_name = friendly_name or entity_id
-    icon_url = None
+    # Prepare optional attachment-based *colored* icon (tinted & cached per ON/OFF).
+    icon_file = None
+    embed = None
     if icon and icon.startswith("mdi:"):
-        icon_slug = icon[4:]
-        icon_path = get_icon_path(icon)
-        if icon_path and icon_path.exists():
-            icon_url = f"{MDI_PNG_URL}{icon_slug}.png"
+        # Tint icon based on current *state* (on/off); not brightness level.
+        colored_path = get_colored_icon_path(icon, device_class, new_state)
+        if colored_path:
+            icon_filename = colored_path.name  # e.g., washing-machine.png
+            try:
+                icon_file = nextcord.File(str(colored_path), filename=icon_filename)
+                embed = nextcord.Embed()
+                embed.set_thumbnail(url=f"attachment://{icon_filename}")
+                # Optional: match embed color to icon tint (pull hex from parent dir)
+                try:
+                    tint_hex = colored_path.parent.name  # 'ffc107' or '44739e'
+                    embed.color = int(tint_hex, 16)
+                except Exception:
+                    pass
+            except Exception as e:
+                log(f"Failed to prepare colored icon for {entity_id}: {e}", color="YELLOW", icon="⚠️")
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -57,7 +105,7 @@ async def notify_watchers(bot, entity_id, old_state, new_state):
         log(f"current_state: {current_state}", level="debug")
         log(f"device_class: {device_class}", level="debug")
         log(f"display_name: {display_name}", level="debug")
-        log(f"icon_url: {icon_url}", level="debug")
+        log(f"icon_file: {icon_file}", level="debug")
         log(f"old_state: {old_state}", level="debug")
         log(f"new_state: {new_state}", level="debug")
         log(f"mapped_old_state: {mapped_old_state}", level="debug")
@@ -79,9 +127,11 @@ async def notify_watchers(bot, entity_id, old_state, new_state):
         log(f"custom_message: {custom_message}", level="debug")
 
         should_notify = False
+        reason = ""
 
+        # --- Rule evaluation ---
         if not rule_type or rule_type == "any":
-            should_notify = True
+            should_notify = (old_state != new_state)
         elif rule_type == "state_change":
             if (from_state == "any" or from_state == old_state) and (to_state == "any" or new_state == to_state):
                 should_notify = True
@@ -100,6 +150,20 @@ async def notify_watchers(bot, entity_id, old_state, new_state):
             except (ValueError, TypeError):
                 log(f"Could not evaluate threshold for {entity_id}: {new_state}", color="YELLOW", icon="⚠️")
 
+        # NEW: brightness change notices (implicit, opt-in if entity is a watched light)
+        # If user is watching this entity (any rule) and it’s a light, notify on brightness change over threshold.
+        # This happens in addition to (not instead of) state rules, but only when enabled in config.
+        if not should_notify and BRIGHTNESS_NOTIFICATIONS and entity_id.startswith("light."):
+            ob = (old_attrs or {}).get("brightness") if isinstance(old_attrs, dict) else None
+            nb = (new_attrs or {}).get("brightness") if isinstance(new_attrs, dict) else None
+            if _brightness_changed_enough(ob, nb):
+                ob_pct, nb_pct = _bri_to_pct(ob), _bri_to_pct(nb)
+                # Construct a brightness-specific message
+                delta_pct = (abs(int(nb) - int(ob)) * 100 / 255) if (ob is not None and nb is not None) else None
+                direction = "↑" if (ob is not None and nb is not None and nb > ob) else ("↓" if (ob is not None and nb is not None and nb < ob) else "")
+                reason = f"brightness change {direction} ({ob_pct}% → {nb_pct}%, Δ≈{round(delta_pct)}%)"
+                should_notify = True
+
         if should_notify:
             message = custom_message or f"`{display_name}` changed to `{mapped_new_state}`"
             message = message.replace("{old_state}", str(mapped_old_state))\
@@ -109,16 +173,21 @@ async def notify_watchers(bot, entity_id, old_state, new_state):
                                .replace("{timestamp}", timestamp)
 
             try:
-                await webhook.send(
-                    content=message,
-                    username=display_name,
-                    avatar_url=icon_url
-                )
-                log(
-                    f"Notified user {user.display_name if user else user_id} ({user_id}) in {channel.guild.name} ({channel.guild.id}) #{channel.name} ({channel_id})",
-                    color="CYAN",
-                    icon="📢"
-                )
+                # If we prepared an embed+attachment icon, put the message in the embed
+                # so the thumbnail shows without needing external hosting.
+                if embed and icon_file:
+                    embed.description = message
+                    await webhook.send(
+                        username=display_name,
+                        embed=embed,
+                        file=icon_file
+                    )
+                else:
+                    # No icon available — send a plain text message.
+                    await webhook.send(
+                        content=message,
+                        username=display_name
+                    )
             except Exception as e:
                 log(f"Failed to send webhook for {entity_id}: {e}", color="YELLOW", icon="⚠️")
         else:
